@@ -1,208 +1,369 @@
 """Message and command handlers for the bot."""
-import logging
+from telethon import events, Button
+from datetime import datetime
+import pytz
+from dateutil import parser as dateutil_parser
+from src.config import settings
+from src.services.vault_service import VaultService
+from src.services.claude_service import ClaudeService
 
-from telethon import events
-
-from src.bot.client import MazkirClient
-from src.services.message_ingestion import MessageIngestionService
-from src.services.llm_service import LLMService
-from src.services.embedding_service import EmbeddingService
-from src.database.connection import async_session_maker
-from src.database.repository import MessageRepository
-
-logger = logging.getLogger(__name__)
+# Initialize services
+vault = VaultService(settings.vault_path, settings.vault_timezone)
+claude = ClaudeService(
+    api_key=settings.anthropic_api_key,
+    vault_path=str(settings.vault_path),
+    timezone=settings.vault_timezone
+)
+tz = pytz.timezone(settings.vault_timezone)
 
 
-class BotHandlers:
-    """Handle bot commands and messages."""
+# Middleware: Only allow authorized user
+def authorized_only(func):
+    """Decorator to restrict commands to authorized user"""
+    async def wrapper(event):
+        if event.sender_id != settings.authorized_user_id:
+            await event.respond("⛔ Unauthorized. This bot is for Marc's personal use only.")
+            return
+        return await func(event)
+    return wrapper
 
-    def __init__(self, client: MazkirClient):
-        self.client = client
-        self.ingestion_service = MessageIngestionService(client)
-        self.llm_service = LLMService(provider="ollama")
-        self.embedding_service = EmbeddingService()
 
-    def register(self):
-        """Register all handlers."""
-        self.client.client.add_event_handler(
-            self.handle_start, events.NewMessage(pattern="/start")
-        )
-        self.client.client.add_event_handler(
-            self.handle_help, events.NewMessage(pattern="/help")
-        )
-        self.client.client.add_event_handler(
-            self.handle_sync, events.NewMessage(pattern=r"/sync(\s+\d+)?")
-        )
-        self.client.client.add_event_handler(
-            self.handle_analyze, events.NewMessage(pattern=r"/analyze(\s+\d+)?")
-        )
-        self.client.client.add_event_handler(
-            self.handle_search, events.NewMessage(pattern=r"/search\s+.+")
-        )
+@authorized_only
+async def cmd_start(event):
+    """Welcome message"""
+    await event.respond(
+        "👋 **Welcome to Mazkir!**\n\n"
+        "Your Personal AI Assistant for productivity and motivation.\n\n"
+        "**Quick commands:**\n"
+        "/day - Today's note\n"
+        "/tasks - Active tasks\n"
+        "/habits - Habit tracker\n"
+        "/tokens - Token balance\n"
+        "/help - Full command list\n\n"
+        "**Or just chat naturally:**\n"
+        "• \"I completed gym\"\n"
+        "• \"Show my streaks\"\n"
+        "• \"Create task: buy milk\""
+    )
+    raise events.StopPropagation
 
-    async def handle_start(self, event):
-        """Handle /start command."""
+
+@authorized_only
+async def cmd_day(event):
+    """Show today's daily note"""
+    try:
+        # Read today's daily note
+        daily = vault.read_daily_note()
+        metadata = daily['metadata']
+
+        # Format response
+        date = datetime.now(tz)
+        day_name = metadata.get('day_of_week', date.strftime('%A'))
+
+        response = f"📅 **{day_name}, {date.strftime('%B %d, %Y')}**\n\n"
+
+        # Tokens
+        tokens_today = metadata.get('tokens_earned', 0)
+        tokens_total = metadata.get('tokens_total', 0)
+        response += f"🪙 **Tokens Today:** {tokens_today}\n"
+        response += f"💰 **Total Bank:** {tokens_total} tokens\n\n"
+
+        # Habits
+        response += "🎯 **Daily Habits**\n"
+        completed_habits = metadata.get('completed_habits', [])
+
+        # Get all active habits to show status
+        active_habits = vault.list_active_habits()
+        for habit_data in active_habits:
+            habit_meta = habit_data['metadata']
+            habit_name = habit_meta.get('name', 'Unknown')
+
+            if habit_name in completed_habits:
+                streak = habit_meta.get('streak', 0)
+                response += f"✅ {habit_name} ({streak} day streak)\n"
+            else:
+                response += f"⏳ {habit_name}\n"
+
+        response += "\n"
+
+        # Tasks (from daily note content)
+        # This is simplified - you might want to parse the markdown content
+        response += "📋 **Tasks**\n"
+        response += "_See /tasks for full list_\n\n"
+
+        # Buttons
+        buttons = [
+            [Button.inline("✏️ Edit Note", b"edit_note")],
+            [Button.inline("📊 Full Details", b"full_note")]
+        ]
+
+        await event.respond(response, buttons=buttons)
+
+    except FileNotFoundError:
         await event.respond(
-            "Welcome to Mazkir!\n\n"
-            "I can help you analyze your Telegram messages and provide insights.\n\n"
-            "Use /help to see available commands."
+            "📝 No daily note for today yet.\n\n"
+            "Would you like me to create one?",
+            buttons=[
+                [Button.inline("✅ Create Note", b"create_note")],
+                [Button.inline("❌ Cancel", b"cancel")]
+            ]
         )
+    except Exception as e:
+        await event.respond(f"❌ Error reading daily note: {str(e)}")
 
-    async def handle_help(self, event):
-        """Handle /help command."""
-        help_text = """
-Available commands:
+    raise events.StopPropagation
 
-/start - Start the bot
-/help - Show this help message
-/sync [limit] - Fetch and store messages from Saved Messages (default: 100)
-/analyze [limit] - Analyze recent stored messages (default: 50)
-/search <query> - Search messages by semantic meaning
 
-Example:
-/sync 200 - Fetch 200 messages
-/analyze 100 - Analyze 100 recent messages
-/search programming tutorials - Find messages about programming
-        """
-        await event.respond(help_text.strip())
+@authorized_only
+async def cmd_tasks(event):
+    """Show active tasks"""
+    try:
+        tasks = vault.list_active_tasks()
 
-    async def handle_sync(self, event):
-        """Handle /sync command to fetch and store messages."""
-        # Parse limit from command
-        text = event.raw_text.strip()
-        parts = text.split()
-        limit = 100  # default
+        if not tasks:
+            await event.respond("✅ No active tasks! You're all caught up.")
+            raise events.StopPropagation
 
-        if len(parts) > 1:
-            try:
-                limit = int(parts[1])
-                limit = min(limit, 1000)  # Cap at 1000
-            except ValueError:
-                await event.respond("Invalid limit. Usage: /sync [number]")
-                return
+        response = "📋 **Active Tasks**\n\n"
 
-        await event.respond(f"Fetching up to {limit} messages from Saved Messages...")
+        # Group by priority
+        high_priority = [t for t in tasks if t['metadata'].get('priority', 3) >= 4]
+        medium_priority = [t for t in tasks if t['metadata'].get('priority', 3) == 3]
+        low_priority = [t for t in tasks if t['metadata'].get('priority', 3) <= 2]
 
+        today = datetime.now(tz).date()
+
+        def format_task(task):
+            """Extract task name from markdown heading"""
+            meta = task['metadata']
+            content = task['content']
+
+            # Try to get name from metadata first
+            name = meta.get('name')
+
+            # If no name in metadata, extract from first markdown heading
+            if not name:
+                for line in content.split('\n'):
+                    line = line.strip()
+                    if line.startswith('#'):
+                        # Remove markdown heading markers
+                        name = line.lstrip('#').strip()
+                        break
+
+            if not name:
+                name = 'Unnamed task'
+
+            return name
+
+        if high_priority:
+            response += "🔴 **High Priority**\n"
+            for task in high_priority:
+                meta = task['metadata']
+                name = format_task(task)
+                due_date = meta.get('due_date')
+
+                status = ""
+                if due_date:
+                    # Convert to date if it's not already
+                    if isinstance(due_date, str):
+                        due_date = dateutil_parser.parse(due_date).date()
+
+                    if due_date < today:
+                        status = f" (overdue: {due_date})"
+                    elif due_date == today:
+                        status = " (due today)"
+
+                response += f"• {name}{status}\n"
+            response += "\n"
+
+        if medium_priority:
+            response += "🟡 **Medium Priority**\n"
+            for task in medium_priority:
+                name = format_task(task)
+                response += f"• {name}\n"
+            response += "\n"
+
+        if low_priority:
+            response += "🟢 **Low Priority**\n"
+            for task in low_priority:
+                name = format_task(task)
+                response += f"• {name}\n"
+            response += "\n"
+
+        response += f"---\nTotal: {len(tasks)} active tasks"
+
+        buttons = [
+            [Button.inline("➕ Add Task", b"add_task")],
+            [Button.inline("✅ Complete Task", b"complete_task")]
+        ]
+
+        await event.respond(response, buttons=buttons)
+
+    except Exception as e:
+        await event.respond(f"❌ Error loading tasks: {str(e)}")
+
+    raise events.StopPropagation
+
+
+@authorized_only
+async def cmd_habits(event):
+    """Show habit tracker summary"""
+    try:
+        habits = vault.list_active_habits()
+
+        if not habits:
+            await event.respond("📝 No active habits yet. Create one to get started!")
+            raise events.StopPropagation
+
+        response = "💪 **Habit Tracker**\n\n"
+
+        # Sort by streak (descending)
+        habits.sort(key=lambda h: h['metadata'].get('streak', 0), reverse=True)
+
+        today = datetime.now(tz).strftime('%Y-%m-%d')
+
+        response += "🔥 **Active Streaks**\n"
+        for habit in habits:
+            meta = habit['metadata']
+            name = meta.get('name', 'Unknown')
+            streak = meta.get('streak', 0)
+            last_completed = meta.get('last_completed')
+
+            # Check if completed today
+            completed_today = last_completed == today
+            status = "✅" if completed_today else "⏳"
+
+            response += f"{status} {name}: {streak} days"
+            if completed_today:
+                response += " (today)"
+            response += "\n"
+
+        response += "\n"
+
+        # Stats
+        total_streaks = sum(h['metadata'].get('streak', 0) for h in habits)
+        avg_streak = total_streaks / len(habits) if habits else 0
+
+        response += "📊 **Stats**\n"
+        response += f"Total habits: {len(habits)}\n"
+        response += f"Average streak: {avg_streak:.1f} days\n"
+
+        buttons = [
+            [Button.inline("✅ Log Habit", b"log_habit")],
+            [Button.inline("📈 View Details", b"habit_details")]
+        ]
+
+        await event.respond(response, buttons=buttons)
+
+    except Exception as e:
+        await event.respond(f"❌ Error loading habits: {str(e)}")
+
+    raise events.StopPropagation
+
+
+@authorized_only
+async def cmd_tokens(event):
+    """Show token balance"""
+    try:
+        ledger = vault.read_token_ledger()
+        metadata = ledger['metadata']
+
+        total = metadata.get('total_tokens', 0)
+        today = metadata.get('tokens_today', 0)
+        all_time = metadata.get('all_time_tokens', 0)
+
+        response = "🪙 **Motivation Tokens**\n\n"
+        response += f"💰 **Current Balance:** {total} tokens\n"
+        response += f"📈 **Today's Earnings:** +{today} tokens\n\n"
+
+        # Try to get today's breakdown
         try:
-            stats = await self.ingestion_service.ingest_saved_messages(limit=limit)
+            daily = vault.read_daily_note()
+            # Parse content for token transactions
+            # This is simplified - you might want better parsing
+            response += "**Today's Activities:**\n"
+            response += "_See daily note for details_\n\n"
+        except:
+            pass
 
-            response = f"""
-Sync complete!
+        response += f"**All Time:** {all_time} tokens\n\n"
 
-Fetched: {stats['total_fetched']} messages
-Newly stored: {stats['new_stored']}
-Already existed: {stats['already_exists']}
-Skipped (no text): {stats['skipped_no_text']}
-Errors: {stats['errors']}
-            """
-            await event.respond(response.strip())
+        # Next milestone
+        next_milestone = ((total // 50) + 1) * 50
+        tokens_needed = next_milestone - total
+        response += f"🎯 **Next Milestone**\n"
+        response += f"{next_milestone} tokens"
+        if tokens_needed > 0:
+            response += f" ({tokens_needed} tokens away!)"
 
-        except Exception as e:
-            logger.error(f"Error during sync: {e}", exc_info=True)
-            await event.respond(f"Error during sync: {str(e)}")
+        buttons = [
+            [Button.inline("📊 Token History", b"token_history")],
+            [Button.inline("🎁 Redeem", b"redeem_tokens")]
+        ]
 
-    async def handle_analyze(self, event):
-        """Handle /analyze command to analyze stored messages."""
-        # Parse limit from command
-        text = event.raw_text.strip()
-        parts = text.split()
-        limit = 50  # default
+        await event.respond(response, buttons=buttons)
 
-        if len(parts) > 1:
-            try:
-                limit = int(parts[1])
-                limit = min(limit, 200)  # Cap at 200
-            except ValueError:
-                await event.respond("Invalid limit. Usage: /analyze [number]")
-                return
+    except Exception as e:
+        await event.respond(f"❌ Error loading tokens: {str(e)}")
 
-        await event.respond(f"Analyzing {limit} recent messages...")
+    raise events.StopPropagation
 
-        try:
-            # Get recent messages from database
-            async with async_session_maker() as session:
-                repo = MessageRepository(session)
-                # Use sender_id "me" to get user's own chat
-                messages = await repo.get_recent_messages(chat_id=event.chat_id, limit=limit)
 
-            if not messages:
-                await event.respond("No messages found. Use /sync first to fetch messages.")
-                return
+@authorized_only
+async def cmd_help(event):
+    """Show help message"""
+    await event.respond(
+        "📖 **Mazkir Bot Commands**\n\n"
+        "**Quick Access**\n"
+        "/day - Today's daily note\n"
+        "/tasks - Your active tasks\n"
+        "/habits - Habit tracker\n"
+        "/tokens - Token balance\n\n"
+        "**Natural Language**\n"
+        "Just chat naturally! Examples:\n"
+        "• \"I completed gym\"\n"
+        "• \"Show my streaks\"\n"
+        "• \"Create task: buy milk\"\n"
+        "• \"What's my progress on learning ML?\"\n\n"
+        "**Settings**\n"
+        "/settings - Configure notifications\n\n"
+        "Need help? Just ask!"
+    )
+    raise events.StopPropagation
 
-            # Extract text from messages
-            message_texts = [msg.text for msg in messages if msg.text]
 
-            if not message_texts:
-                await event.respond("No text messages found to analyze.")
-                return
+# Natural language handler (catch-all)
+@authorized_only
+async def handle_message(event):
+    """Handle natural language messages via Claude"""
+    # Skip if it's a command
+    if event.message.text.startswith('/'):
+        return
 
-            # Analyze with LLM
-            analysis = await self.llm_service.analyze_messages(message_texts)
+    try:
+        # Show typing indicator
+        async with event.client.action(event.chat_id, 'typing'):
+            # Get Claude's response
+            response = claude.chat(event.message.text)
 
             # Send response
-            await event.respond(f"Analysis of {len(message_texts)} messages:\n\n{analysis}")
+            await event.respond(response)
 
-        except Exception as e:
-            logger.error(f"Error during analysis: {e}", exc_info=True)
-            await event.respond(f"Error during analysis: {str(e)}")
+    except Exception as e:
+        await event.respond(f"❌ Sorry, I encountered an error: {str(e)}")
 
-    async def handle_search(self, event):
-        """Handle /search command for semantic search."""
-        # Extract query from command
-        text = event.raw_text.strip()
+    raise events.StopPropagation
 
-        # Remove '/search ' prefix
-        if not text.startswith('/search '):
-            await event.respond("Usage: /search <your query>\n\nExample: /search programming tutorials")
-            return
 
-        query = text[8:].strip()  # Remove '/search '
-
-        if not query:
-            await event.respond("Please provide a search query.\n\nExample: /search machine learning")
-            return
-
-        await event.respond(f"Searching for: {query}...")
-
-        try:
-            # Generate embedding for the query
-            query_embedding = await self.embedding_service.embed_text(query)
-
-            # Search for similar messages
-            async with async_session_maker() as session:
-                repo = MessageRepository(session)
-                similar_messages = await repo.search_similar(
-                    embedding=query_embedding,
-                    limit=10
-                )
-
-            if not similar_messages:
-                await event.respond("No messages found. Try syncing messages first with /sync")
-                return
-
-            # Format results
-            response = f"Found {len(similar_messages)} similar messages:\n\n"
-
-            for i, msg in enumerate(similar_messages, 1):
-                # Format date
-                date_str = msg.date.strftime("%Y-%m-%d")
-
-                # Truncate long messages
-                text_preview = msg.text[:150] if msg.text else "[No text]"
-                if len(msg.text or "") > 150:
-                    text_preview += "..."
-
-                response += f"{i}. [{date_str}] {text_preview}\n\n"
-
-            # Split response if too long (Telegram limit is ~4096 chars)
-            if len(response) > 4000:
-                # Send in chunks
-                chunks = [response[i:i+4000] for i in range(0, len(response), 4000)]
-                for chunk in chunks:
-                    await event.respond(chunk)
-            else:
-                await event.respond(response.strip())
-
-        except Exception as e:
-            logger.error(f"Error during search: {e}", exc_info=True)
-            await event.respond(f"Error during search: {str(e)}")
+# Export handlers with their patterns
+def get_handlers():
+    """Return list of (handler, event_builder) tuples"""
+    return [
+        (cmd_start, events.NewMessage(pattern='/start')),
+        (cmd_day, events.NewMessage(pattern='/day')),
+        (cmd_tasks, events.NewMessage(pattern='/tasks')),
+        (cmd_habits, events.NewMessage(pattern='/habits')),
+        (cmd_tokens, events.NewMessage(pattern='/tokens')),
+        (cmd_help, events.NewMessage(pattern='/help')),
+        (handle_message, events.NewMessage())  # Must be last (catch-all)
+    ]
