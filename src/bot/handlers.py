@@ -351,6 +351,9 @@ async def cmd_help(event):
 @authorized_only
 async def handle_message(event):
     """Handle natural language messages via Claude"""
+    import logging
+    logger = logging.getLogger(__name__)
+
     # Skip if it's a command
     if event.message.text.startswith('/'):
         return
@@ -358,16 +361,183 @@ async def handle_message(event):
     try:
         # Show typing indicator
         async with event.client.action(event.chat_id, 'typing'):
-            # Get Claude's response
-            response = claude.chat(event.message.text)
+            user_message = event.message.text
+
+            # Get list of habits for context
+            habits = vault.list_active_habits()
+            habit_names = [h['metadata'].get('name', 'Unknown') for h in habits]
+
+            # Parse user intent
+            logger.info(f"Parsing intent for message: {user_message}")
+            intent_result = claude.parse_intent(user_message, habit_names)
+            logger.info(f"Intent: {intent_result.get('intent')}, Data: {intent_result.get('data')}")
+
+            intent = intent_result.get('intent')
+            data = intent_result.get('data', {})
+
+            # Handle different intents
+            if intent == 'HABIT_COMPLETION':
+                response = await handle_habit_completion(data)
+            elif intent == 'TASK_CREATION':
+                response = await handle_task_creation(data)
+            elif intent == 'QUERY':
+                response = await handle_query(data, user_message)
+            else:
+                # General chat - just use Claude
+                response = claude.chat(user_message)
 
             # Send response
             await event.respond(response)
 
     except Exception as e:
+        logger.error(f"Error in natural language handler: {e}", exc_info=True)
         await event.respond(f"❌ Sorry, I encountered an error: {str(e)}")
 
     raise events.StopPropagation
+
+
+async def handle_habit_completion(data: dict) -> str:
+    """Handle habit completion intent"""
+    import logging
+    logger = logging.getLogger(__name__)
+
+    habit_name = data.get('habit_name', '').lower()
+    confidence = data.get('confidence', 'low')
+
+    logger.info(f"Habit completion: {habit_name}, confidence: {confidence}")
+
+    if not habit_name:
+        return "I'm not sure which habit you completed. Could you be more specific?"
+
+    # Find matching habit
+    habits = vault.list_active_habits()
+    matched_habit = None
+
+    for habit in habits:
+        h_name = habit['metadata'].get('name', '').lower()
+        if habit_name in h_name or h_name in habit_name:
+            matched_habit = habit
+            break
+
+    if not matched_habit:
+        return f"❌ I couldn't find a habit matching '{habit_name}'. Available habits: {', '.join([h['metadata'].get('name') for h in habits])}"
+
+    # Get habit details
+    habit_meta = matched_habit['metadata']
+    habit_full_name = habit_meta.get('name')
+    current_streak = habit_meta.get('streak', 0)
+    tokens_per_completion = habit_meta.get('tokens_per_completion', 5)
+
+    # Update habit
+    today = datetime.now(tz).strftime('%Y-%m-%d')
+    last_completed = habit_meta.get('last_completed')
+
+    # Check if already completed today
+    if last_completed == today:
+        return f"✅ You already completed **{habit_full_name}** today! Current streak: {current_streak} days"
+
+    # Update streak
+    new_streak = current_streak + 1
+
+    # Update habit file
+    habit_path = matched_habit['path']
+    vault.update_file(habit_path, {
+        'streak': new_streak,
+        'last_completed': today,
+        'longest_streak': max(habit_meta.get('longest_streak', 0), new_streak)
+    })
+
+    # Award tokens
+    token_result = vault.update_tokens(tokens_per_completion, f"Completed {habit_full_name}")
+
+    # Build response
+    response = f"💪 Excellent! **{habit_full_name}** completed!\n\n"
+    response += f"🔥 Streak: {current_streak} → **{new_streak} days**\n"
+    response += f"🪙 Tokens: +{tokens_per_completion}\n"
+    response += f"💰 New balance: **{token_result['new_total']} tokens**\n\n"
+
+    # Encouragement based on streak milestones
+    if new_streak == 7:
+        response += "🎉 One week streak! Keep it up!"
+    elif new_streak == 30:
+        response += "🏆 30 days! You're building a solid habit!"
+    elif new_streak == 100:
+        response += "⭐ 100 days! Legendary!"
+    elif new_streak % 10 == 0:
+        response += f"✨ {new_streak} days! You're on fire!"
+
+    return response
+
+
+async def handle_task_creation(data: dict) -> str:
+    """Handle task creation intent"""
+    task_description = data.get('task_description', '').strip()
+    priority = data.get('priority', 3)
+
+    if not task_description:
+        return "I'm not sure what task you want to create. Please describe the task."
+
+    # Create task file
+    # Sanitize filename
+    import re
+    filename = re.sub(r'[^\w\s-]', '', task_description)
+    filename = re.sub(r'[-\s]+', '-', filename)
+    filename = filename[:50]  # Limit length
+
+    task_path = f"40-tasks/active/{filename}.md"
+    today = datetime.now(tz).strftime('%Y-%m-%d')
+
+    metadata = {
+        'type': 'task',
+        'status': 'active',
+        'priority': priority,
+        'category': 'personal',
+        'tags': ['task'],
+        'created': today,
+        'updated': today
+    }
+
+    content = f"# {task_description}\n\n"
+
+    vault.write_file(task_path, metadata, content)
+
+    priority_label = {5: "🔴 High", 4: "🔴 High", 3: "🟡 Medium", 2: "🟢 Low", 1: "🟢 Low"}.get(priority, "🟡 Medium")
+
+    return f"✅ Task created: **{task_description}**\n\n" \
+           f"Priority: {priority_label}\n" \
+           f"Status: Active\n\n" \
+           f"Use /tasks to view all active tasks."
+
+
+async def handle_query(data: dict, original_message: str) -> str:
+    """Handle query intent"""
+    query_type = data.get('query_type', 'general')
+
+    if query_type == 'streaks':
+        habits = vault.list_active_habits()
+        habits.sort(key=lambda h: h['metadata'].get('streak', 0), reverse=True)
+
+        response = "🔥 **Your Habit Streaks**\n\n"
+        for habit in habits[:10]:  # Top 10
+            meta = habit['metadata']
+            name = meta.get('name')
+            streak = meta.get('streak', 0)
+            longest = meta.get('longest_streak', 0)
+            response += f"• **{name}**: {streak} days (best: {longest})\n"
+
+        return response
+
+    elif query_type == 'tokens':
+        ledger = vault.read_token_ledger()
+        meta = ledger['metadata']
+        return f"🪙 **Token Balance**\n\n" \
+               f"💰 Current: **{meta.get('total_tokens', 0)} tokens**\n" \
+               f"📈 Today: +{meta.get('tokens_today', 0)}\n" \
+               f"⭐ All time: {meta.get('all_time_tokens', 0)}"
+
+    else:
+        # General query - use Claude
+        return claude.chat(original_message)
 
 
 # Export handlers with their patterns

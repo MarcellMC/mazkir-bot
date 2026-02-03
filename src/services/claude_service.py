@@ -95,22 +95,74 @@ When Marc completes an activity:
 
         return response.content[0].text
 
-    def process_completion(self, activity: str) -> Dict:
-        """Process activity completion and determine actions
+    def parse_intent(self, message: str, habits_list: List[str] = None) -> Dict:
+        """Parse user message to determine intent and extract structured data
 
         Args:
-            activity: Description of completed activity
+            message: User's message
+            habits_list: List of habit names for context
 
         Returns:
-            Dict with 'response' (text) and 'actions' (list of dicts)
+            Dict with 'intent', 'data', and 'response_text'
         """
-        # This is a simplified version
-        # In practice, Claude would parse the activity and return structured data
+        now = datetime.now(self.tz)
 
-        message = f"I completed: {activity}"
-        response = self.chat(message)
+        # Build context with available habits
+        habits_context = ""
+        if habits_list:
+            habits_context = f"\n\nAvailable habits: {', '.join(habits_list)}"
 
-        return {
-            'response': response,
-            'actions': []  # Parse actions from response if needed
-        }
+        intent_prompt = f"""Analyze this message and determine the user's intent.
+
+Message: "{message}"
+
+Current date: {now.strftime('%Y-%m-%d')}
+Current time: {now.strftime('%H:%M')}{habits_context}
+
+Possible intents:
+1. HABIT_COMPLETION - User completed a habit (e.g., "I completed gym", "did meditation", "finished reading")
+2. TASK_CREATION - User wants to create a task (e.g., "create task: buy milk", "add task to buy groceries")
+3. TASK_COMPLETION - User completed a task
+4. QUERY - User is asking a question (e.g., "show my streaks", "what's my progress")
+5. GENERAL_CHAT - General conversation
+
+Return a JSON object with:
+{{
+  "intent": "HABIT_COMPLETION|TASK_CREATION|TASK_COMPLETION|QUERY|GENERAL_CHAT",
+  "data": {{
+    // For HABIT_COMPLETION: {{"habit_name": "gym", "confidence": "high|medium|low"}}
+    // For TASK_CREATION: {{"task_description": "buy milk", "priority": 3}}
+    // For TASK_COMPLETION: {{"task_name": "..."}}
+    // For QUERY: {{"query_type": "streaks|progress|tokens"}}
+    // For GENERAL_CHAT: {{}}
+  }},
+  "reasoning": "Brief explanation of why you chose this intent"
+}}
+
+Respond ONLY with valid JSON, no other text."""
+
+        response = self.client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=500,
+            messages=[{
+                "role": "user",
+                "content": intent_prompt
+            }]
+        )
+
+        import json
+        import re
+
+        # Extract JSON from response
+        response_text = response.content[0].text
+        # Try to find JSON in the response
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group())
+        else:
+            # Fallback to general chat if JSON parsing fails
+            return {
+                "intent": "GENERAL_CHAT",
+                "data": {},
+                "reasoning": "Failed to parse intent"
+            }
