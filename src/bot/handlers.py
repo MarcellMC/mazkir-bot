@@ -38,6 +38,7 @@ async def cmd_start(event):
         "/day - Today's note\n"
         "/tasks - Active tasks\n"
         "/habits - Habit tracker\n"
+        "/goals - Active goals\n"
         "/tokens - Token balance\n"
         "/help - Full command list\n\n"
         "**Or just chat naturally:**\n"
@@ -325,6 +326,91 @@ async def cmd_tokens(event):
 
 
 @authorized_only
+async def cmd_goals(event):
+    """Show active goals"""
+    import logging
+    logger = logging.getLogger(__name__)
+
+    try:
+        goals = vault.list_active_goals()
+
+        logger.info(f"Found {len(goals)} active goals")
+
+        if not goals:
+            await event.respond("🎯 No active goals! Use /help to see how to create goals.")
+            raise events.StopPropagation
+
+        response = "🎯 **Active Goals**\n\n"
+
+        today = datetime.now(tz).date()
+
+        for goal in goals:
+            meta = goal['metadata']
+            name = meta.get('name', 'Unnamed goal')
+            status = meta.get('status', 'unknown')
+            priority = meta.get('priority', 'medium')
+            progress = meta.get('progress', 0)
+            target_date = meta.get('target_date')
+
+            # Priority emoji
+            priority_emoji = {'high': '🔴', 'medium': '🟡', 'low': '🟢'}.get(priority.lower(), '🟡')
+
+            # Status emoji
+            status_emoji = {
+                'in-progress': '🏃',
+                'not-started': '⏸️',
+                'active': '🏃',
+                'planning': '📋'
+            }.get(status.lower(), '❓')
+
+            # Progress bar
+            progress_bars = int(progress / 10)
+            progress_bar = '█' * progress_bars + '░' * (10 - progress_bars)
+
+            response += f"{priority_emoji} **{name}**\n"
+            response += f"{status_emoji} Status: {status.capitalize()}\n"
+            response += f"📊 Progress: [{progress_bar}] {progress}%\n"
+
+            # Show target date
+            if target_date:
+                if isinstance(target_date, str):
+                    from dateutil import parser as dateutil_parser
+                    target_date = dateutil_parser.parse(target_date).date()
+
+                days_left = (target_date - today).days
+                if days_left < 0:
+                    response += f"⚠️ Overdue by {abs(days_left)} days\n"
+                elif days_left == 0:
+                    response += f"🔥 Due today!\n"
+                else:
+                    response += f"📅 {days_left} days remaining\n"
+
+            # Show milestones
+            milestones = meta.get('milestones', [])
+            if milestones:
+                completed = sum(1 for m in milestones if m.get('status') == 'completed')
+                total = len(milestones)
+                response += f"🎖️ Milestones: {completed}/{total} completed\n"
+
+            response += "\n"
+
+        response += f"---\nTotal: {len(goals)} active goals"
+
+        buttons = [
+            [Button.inline("📊 View Details", b"goal_details")],
+            [Button.inline("➕ Add Goal", b"add_goal")]
+        ]
+
+        await event.respond(response, buttons=buttons)
+
+    except Exception as e:
+        logger.error(f"Error loading goals: {e}", exc_info=True)
+        await event.respond(f"❌ Error loading goals: {str(e)}")
+
+    raise events.StopPropagation
+
+
+@authorized_only
 async def cmd_help(event):
     """Show help message"""
     await event.respond(
@@ -333,6 +419,7 @@ async def cmd_help(event):
         "/day - Today's daily note\n"
         "/tasks - Your active tasks\n"
         "/habits - Habit tracker\n"
+        "/goals - Active goals\n"
         "/tokens - Token balance\n\n"
         "**Natural Language**\n"
         "Just chat naturally! Examples:\n"
@@ -548,6 +635,7 @@ def get_handlers():
         (cmd_day, events.NewMessage(pattern='/day')),
         (cmd_tasks, events.NewMessage(pattern='/tasks')),
         (cmd_habits, events.NewMessage(pattern='/habits')),
+        (cmd_goals, events.NewMessage(pattern='/goals')),
         (cmd_tokens, events.NewMessage(pattern='/tokens')),
         (cmd_help, events.NewMessage(pattern='/help')),
         (handle_message, events.NewMessage())  # Must be last (catch-all)

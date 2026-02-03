@@ -172,6 +172,34 @@ class VaultService:
 
         return sorted(tasks, key=sort_key)
 
+    def list_active_goals(self) -> List[Dict]:
+        """Get all active goals (not completed or archived)"""
+        from datetime import datetime
+
+        # Get current year
+        current_year = datetime.now(self.tz).year
+
+        # Look for goals in current year directory
+        goal_files = self.list_files(f"30-goals/{current_year}")
+        goals = []
+
+        for file_path in goal_files:
+            data = self.read_file(str(file_path))
+            status = data['metadata'].get('status', '').lower()
+
+            # Include goals that are in-progress or not-started
+            if status in ['in-progress', 'not-started', 'active', 'planning']:
+                goals.append(data)
+
+        # Sort by priority (high to low) then progress (low to high)
+        def sort_key(goal):
+            priority_map = {'high': 3, 'medium': 2, 'low': 1}
+            priority = priority_map.get(goal['metadata'].get('priority', 'medium').lower(), 2)
+            progress = goal['metadata'].get('progress', 0)
+            return (-priority, progress)
+
+        return sorted(goals, key=sort_key)
+
     def read_token_ledger(self) -> Dict:
         """Read motivation tokens ledger"""
         return self.read_file("00-system/motivation-tokens.md")
