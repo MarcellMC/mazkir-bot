@@ -117,8 +117,15 @@ async def cmd_day(event):
 @authorized_only
 async def cmd_tasks(event):
     """Show active tasks"""
+    import logging
+    logger = logging.getLogger(__name__)
+
     try:
         tasks = vault.list_active_tasks()
+
+        logger.info(f"Found {len(tasks)} tasks in 40-tasks/active/")
+        for task in tasks:
+            logger.info(f"  - Task: {task['path']}, priority: {task['metadata'].get('priority', 3)}")
 
         if not tasks:
             await event.respond("✅ No active tasks! You're all caught up.")
@@ -135,6 +142,7 @@ async def cmd_tasks(event):
 
         def format_task(task):
             """Extract task name from markdown heading"""
+            import re
             meta = task['metadata']
             content = task['content']
 
@@ -148,6 +156,13 @@ async def cmd_tasks(event):
                     if line.startswith('#'):
                         # Remove markdown heading markers
                         name = line.lstrip('#').strip()
+
+                        # Remove markdown links: [text](url) -> text
+                        name = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', name)
+
+                        # Remove other markdown formatting
+                        name = name.replace('**', '').replace('*', '').replace('`', '')
+
                         break
 
             if not name:

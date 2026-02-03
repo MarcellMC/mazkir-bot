@@ -4,9 +4,9 @@ import logging
 from telethon import TelegramClient, events
 from src.config import settings
 
-# Configure logging
+# Configure logging (always INFO for now to see handler logs)
 logging.basicConfig(
-    level=logging.INFO if settings.debug else logging.WARNING,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
