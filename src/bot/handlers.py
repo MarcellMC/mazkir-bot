@@ -42,9 +42,10 @@ async def cmd_start(event):
         "/tokens - Token balance\n"
         "/help - Full command list\n\n"
         "**Or just chat naturally:**\n"
-        "• \"I completed gym\"\n"
-        "• \"Show my streaks\"\n"
-        "• \"Create task: buy milk\""
+        "• \"I completed gym\" - Log a habit\n"
+        "• \"Create task: buy milk\" - Add a task\n"
+        "• \"Create goal: learn python\" - Set a goal\n"
+        "• \"Done with groceries\" - Complete a task"
     )
     raise events.StopPropagation
 
@@ -101,14 +102,40 @@ async def cmd_day(event):
         await event.respond(response, buttons=buttons)
 
     except FileNotFoundError:
-        await event.respond(
-            "📝 No daily note for today yet.\n\n"
-            "Would you like me to create one?",
-            buttons=[
-                [Button.inline("✅ Create Note", b"create_note")],
-                [Button.inline("❌ Cancel", b"cancel")]
-            ]
-        )
+        # Auto-create daily note from template
+        try:
+            daily = vault.create_daily_note()
+            metadata = daily['metadata']
+
+            date = datetime.now(tz)
+            day_name = metadata.get('day_of_week', date.strftime('%A'))
+
+            response = f"📅 **{day_name}, {date.strftime('%B %d, %Y')}**\n\n"
+            response += "📝 _Daily note created!_\n\n"
+
+            tokens_total = metadata.get('tokens_total', 0)
+            response += f"🪙 **Tokens Today:** 0\n"
+            response += f"💰 **Total Bank:** {tokens_total} tokens\n\n"
+
+            response += "🎯 **Daily Habits**\n"
+            active_habits = vault.list_active_habits()
+            for habit_data in active_habits:
+                habit_name = habit_data['metadata'].get('name', 'Unknown')
+                response += f"⏳ {habit_name}\n"
+
+            response += "\n📋 **Tasks**\n"
+            response += "_See /tasks for full list_\n"
+
+            await event.respond(response)
+        except Exception as create_error:
+            await event.respond(
+                f"📝 No daily note for today yet.\n\n"
+                f"Error creating: {str(create_error)}",
+                buttons=[
+                    [Button.inline("🔄 Retry", b"create_note")],
+                    [Button.inline("❌ Cancel", b"cancel")]
+                ]
+            )
     except Exception as e:
         await event.respond(f"❌ Error reading daily note: {str(e)}")
 
@@ -422,13 +449,17 @@ async def cmd_help(event):
         "/goals - Active goals\n"
         "/tokens - Token balance\n\n"
         "**Natural Language**\n"
-        "Just chat naturally! Examples:\n"
+        "Just chat naturally! Examples:\n\n"
+        "_Complete activities:_\n"
         "• \"I completed gym\"\n"
-        "• \"Show my streaks\"\n"
+        "• \"Done with buy groceries\"\n\n"
+        "_Create items:_\n"
         "• \"Create task: buy milk\"\n"
-        "• \"What's my progress on learning ML?\"\n\n"
-        "**Settings**\n"
-        "/settings - Configure notifications\n\n"
+        "• \"Create habit: morning run\"\n"
+        "• \"Create goal: learn python\"\n\n"
+        "_Ask questions:_\n"
+        "• \"Show my streaks\"\n"
+        "• \"What are my tokens?\"\n\n"
         "Need help? Just ask!"
     )
     raise events.StopPropagation
@@ -454,9 +485,13 @@ async def handle_message(event):
             habits = vault.list_active_habits()
             habit_names = [h['metadata'].get('name', 'Unknown') for h in habits]
 
+            # Get list of tasks for context
+            tasks = vault.list_active_tasks()
+            task_names = [t['metadata'].get('name', '') for t in tasks if t['metadata'].get('name')]
+
             # Parse user intent
             logger.info(f"Parsing intent for message: {user_message}")
-            intent_result = claude.parse_intent(user_message, habit_names)
+            intent_result = claude.parse_intent(user_message, habit_names, task_names)
             logger.info(f"Intent: {intent_result.get('intent')}, Data: {intent_result.get('data')}")
 
             intent = intent_result.get('intent')
@@ -465,8 +500,14 @@ async def handle_message(event):
             # Handle different intents
             if intent == 'HABIT_COMPLETION':
                 response = await handle_habit_completion(data)
+            elif intent == 'HABIT_CREATION':
+                response = await handle_habit_creation(data)
             elif intent == 'TASK_CREATION':
                 response = await handle_task_creation(data)
+            elif intent == 'TASK_COMPLETION':
+                response = await handle_task_completion(data)
+            elif intent == 'GOAL_CREATION':
+                response = await handle_goal_creation(data)
             elif intent == 'QUERY':
                 response = await handle_query(data, user_message)
             else:
@@ -557,43 +598,123 @@ async def handle_habit_completion(data: dict) -> str:
 
 
 async def handle_task_creation(data: dict) -> str:
-    """Handle task creation intent"""
-    task_description = data.get('task_description', '').strip()
+    """Handle task creation intent using template"""
+    # Support both 'task_name' and 'task_description' keys
+    task_name = data.get('task_name') or data.get('task_description', '')
+    task_name = task_name.strip()
     priority = data.get('priority', 3)
+    due_date = data.get('due_date')
+    category = data.get('category', 'personal')
 
-    if not task_description:
+    if not task_name:
         return "I'm not sure what task you want to create. Please describe the task."
 
-    # Create task file
-    # Sanitize filename
-    import re
-    filename = re.sub(r'[^\w\s-]', '', task_description)
-    filename = re.sub(r'[-\s]+', '-', filename)
-    filename = filename[:50]  # Limit length
-
-    task_path = f"40-tasks/active/{filename}.md"
-    today = datetime.now(tz).strftime('%Y-%m-%d')
-
-    metadata = {
-        'type': 'task',
-        'status': 'active',
-        'priority': priority,
-        'category': 'personal',
-        'tags': ['task'],
-        'created': today,
-        'updated': today
-    }
-
-    content = f"# {task_description}\n\n"
-
-    vault.write_file(task_path, metadata, content)
+    # Create task using template
+    result = vault.create_task(
+        name=task_name,
+        priority=priority,
+        due_date=due_date,
+        category=category,
+        tokens_on_completion=5 if priority <= 2 else 10 if priority <= 3 else 15
+    )
 
     priority_label = {5: "🔴 High", 4: "🔴 High", 3: "🟡 Medium", 2: "🟢 Low", 1: "🟢 Low"}.get(priority, "🟡 Medium")
+    tokens = result['metadata'].get('tokens_on_completion', 5)
 
-    return f"✅ Task created: **{task_description}**\n\n" \
-           f"Priority: {priority_label}\n" \
-           f"Status: Active\n\n" \
-           f"Use /tasks to view all active tasks."
+    response = f"✅ Task created: **{task_name}**\n\n"
+    response += f"Priority: {priority_label}\n"
+    if due_date:
+        response += f"Due: {due_date}\n"
+    response += f"Tokens on completion: {tokens}\n\n"
+    response += "Use /tasks to view all active tasks."
+
+    return response
+
+
+async def handle_habit_creation(data: dict) -> str:
+    """Handle habit creation intent using template"""
+    habit_name = data.get('habit_name', '').strip()
+    frequency = data.get('frequency', 'daily')
+    category = data.get('category', 'personal')
+
+    if not habit_name:
+        return "I'm not sure what habit you want to create. Please describe the habit."
+
+    # Create habit using template
+    result = vault.create_habit(
+        name=habit_name,
+        frequency=frequency,
+        category=category,
+        difficulty='medium',
+        tokens_per_completion=5
+    )
+
+    response = f"✅ Habit created: **{habit_name}**\n\n"
+    response += f"📅 Frequency: {frequency}\n"
+    response += f"📁 Category: {category}\n"
+    response += f"🪙 Tokens per completion: 5\n\n"
+    response += "Use /habits to view your habit tracker."
+
+    return response
+
+
+async def handle_goal_creation(data: dict) -> str:
+    """Handle goal creation intent using template"""
+    goal_name = data.get('goal_name', '').strip()
+    priority = data.get('priority', 'medium')
+    category = data.get('category', 'personal')
+    target_date = data.get('target_date')
+
+    if not goal_name:
+        return "I'm not sure what goal you want to create. Please describe the goal."
+
+    # Create goal using template
+    result = vault.create_goal(
+        name=goal_name,
+        priority=priority,
+        target_date=target_date,
+        category=category
+    )
+
+    priority_emoji = {'high': '🔴', 'medium': '🟡', 'low': '🟢'}.get(priority.lower(), '🟡')
+
+    response = f"🎯 Goal created: **{goal_name}**\n\n"
+    response += f"{priority_emoji} Priority: {priority.capitalize()}\n"
+    response += f"📁 Category: {category}\n"
+    if target_date:
+        response += f"📅 Target: {target_date}\n"
+    response += f"📊 Progress: 0%\n\n"
+    response += "Use /goals to view your active goals."
+
+    return response
+
+
+async def handle_task_completion(data: dict) -> str:
+    """Handle task completion intent"""
+    task_name = data.get('task_name', '').strip()
+    confidence = data.get('confidence', 'low')
+
+    if not task_name:
+        return "I'm not sure which task you completed. Could you be more specific?"
+
+    # Find matching task
+    task = vault.find_task_by_name(task_name)
+
+    if not task:
+        # List available tasks
+        tasks = vault.list_active_tasks()
+        task_names = [t['metadata'].get('name', 'Unknown') for t in tasks[:5]]
+        return f"❌ I couldn't find a task matching '{task_name}'.\n\nActive tasks: {', '.join(task_names)}"
+
+    # Complete the task
+    result = vault.complete_task(task['path'])
+
+    response = f"✅ Task completed: **{result['task_name']}**\n\n"
+    if result['tokens_earned'] > 0:
+        response += f"🪙 Tokens earned: +{result['tokens_earned']}\n\n"
+    response += "Great job! Use /tasks to see remaining tasks."
+
+    return response
 
 
 async def handle_query(data: dict, original_message: str) -> str:

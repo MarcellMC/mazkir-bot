@@ -1,7 +1,9 @@
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import frontmatter
 import pytz
+import re
+import shutil
 from typing import Dict, List, Optional
 
 
@@ -254,3 +256,357 @@ class VaultService:
             'new_total': new_total,
             'activity': activity
         }
+
+    # =========================================================================
+    # Template-based creation methods
+    # =========================================================================
+
+    def _load_template(self, template_name: str) -> Dict:
+        """Load a template file and return metadata and content
+
+        Args:
+            template_name: Template filename (e.g., '_task_.md')
+
+        Returns:
+            Dict with 'metadata' and 'content'
+        """
+        template_path = f"00-system/templates/{template_name}"
+        return self.read_file(template_path)
+
+    def _process_template(self, template: Dict, substitutions: Dict) -> Dict:
+        """Process template by replacing placeholders
+
+        Args:
+            template: Dict with 'metadata' and 'content'
+            substitutions: Dict of placeholder -> value mappings
+
+        Returns:
+            Dict with processed 'metadata' and 'content'
+        """
+        metadata = template['metadata'].copy()
+        content = template['content']
+
+        # Process content placeholders
+        for key, value in substitutions.items():
+            placeholder = "{{" + key + "}}"
+            content = content.replace(placeholder, str(value) if value else "")
+
+            # Also process metadata string values
+            for meta_key, meta_value in metadata.items():
+                if isinstance(meta_value, str) and placeholder in meta_value:
+                    metadata[meta_key] = meta_value.replace(placeholder, str(value) if value else "")
+
+        return {
+            'metadata': metadata,
+            'content': content
+        }
+
+    def _sanitize_filename(self, name: str, max_length: int = 50) -> str:
+        """Convert a name to a valid filename
+
+        Args:
+            name: Original name
+            max_length: Maximum filename length
+
+        Returns:
+            Sanitized filename (without extension)
+        """
+        # Remove special characters
+        filename = re.sub(r'[^\w\s-]', '', name)
+        # Replace spaces with hyphens
+        filename = re.sub(r'[-\s]+', '-', filename)
+        # Lowercase
+        filename = filename.lower().strip('-')
+        # Limit length
+        return filename[:max_length]
+
+    def create_task(self, name: str, priority: int = 3, due_date: str = None,
+                    category: str = "personal", tokens_on_completion: int = 5) -> Dict:
+        """Create a new task using template
+
+        Args:
+            name: Task name/description
+            priority: 1-5 (5=highest)
+            due_date: Optional due date (YYYY-MM-DD)
+            category: work, personal, health, learning
+            tokens_on_completion: Tokens awarded when done
+
+        Returns:
+            Dict with created task data and path
+        """
+        today = datetime.now(self.tz).strftime('%Y-%m-%d')
+
+        # Load and process template
+        template = self._load_template('_task_.md')
+        processed = self._process_template(template, {
+            'title': name,
+            'date': today
+        })
+
+        # Override metadata with provided values
+        metadata = processed['metadata']
+        metadata['type'] = 'task'
+        metadata['name'] = name
+        metadata['status'] = 'active'
+        metadata['priority'] = priority
+        metadata['due_date'] = due_date
+        metadata['category'] = category
+        metadata['tokens_on_completion'] = tokens_on_completion
+        metadata['tags'] = ['task', category]
+        metadata['created'] = today
+        metadata['updated'] = today
+
+        # Generate filename and path
+        filename = self._sanitize_filename(name)
+        task_path = f"40-tasks/active/{filename}.md"
+
+        # Write file
+        self.write_file(task_path, metadata, processed['content'])
+
+        return {
+            'path': task_path,
+            'metadata': metadata,
+            'content': processed['content']
+        }
+
+    def create_habit(self, name: str, frequency: str = "daily",
+                     category: str = "personal", difficulty: str = "medium",
+                     tokens_per_completion: int = 5) -> Dict:
+        """Create a new habit using template
+
+        Args:
+            name: Habit name
+            frequency: daily, 3x/week, weekly, etc.
+            category: health, learning, productivity, personal
+            difficulty: easy, medium, hard
+            tokens_per_completion: Tokens per completion
+
+        Returns:
+            Dict with created habit data and path
+        """
+        today = datetime.now(self.tz).strftime('%Y-%m-%d')
+
+        # Load and process template
+        template = self._load_template('_habit_.md')
+        processed = self._process_template(template, {
+            'title': name,
+            'date': today
+        })
+
+        # Override metadata
+        metadata = processed['metadata']
+        metadata['type'] = 'habit'
+        metadata['name'] = name
+        metadata['frequency'] = frequency
+        metadata['streak'] = 0
+        metadata['longest_streak'] = 0
+        metadata['last_completed'] = None
+        metadata['status'] = 'active'
+        metadata['category'] = category
+        metadata['difficulty'] = difficulty
+        metadata['tokens_per_completion'] = tokens_per_completion
+        metadata['tags'] = ['habit', category]
+        metadata['created'] = today
+        metadata['updated'] = today
+
+        # Generate filename and path
+        filename = self._sanitize_filename(name)
+        habit_path = f"20-habits/{filename}.md"
+
+        # Write file
+        self.write_file(habit_path, metadata, processed['content'])
+
+        return {
+            'path': habit_path,
+            'metadata': metadata,
+            'content': processed['content']
+        }
+
+    def create_goal(self, name: str, priority: str = "medium",
+                    target_date: str = None, category: str = "personal") -> Dict:
+        """Create a new goal using template
+
+        Args:
+            name: Goal name
+            priority: high, medium, low
+            target_date: Optional target completion date (YYYY-MM-DD)
+            category: career, health, learning, finance, personal
+
+        Returns:
+            Dict with created goal data and path
+        """
+        now = datetime.now(self.tz)
+        today = now.strftime('%Y-%m-%d')
+        current_year = now.year
+
+        # Load and process template
+        template = self._load_template('_goal_.md')
+        processed = self._process_template(template, {
+            'title': name,
+            'date': today
+        })
+
+        # Override metadata
+        metadata = processed['metadata']
+        metadata['type'] = 'goal'
+        metadata['name'] = name
+        metadata['status'] = 'not-started'
+        metadata['priority'] = priority
+        metadata['start_date'] = today
+        metadata['target_date'] = target_date
+        metadata['progress'] = 0
+        metadata['category'] = category
+        metadata['tags'] = ['goal', category]
+        metadata['milestones'] = []
+        metadata['related_tasks'] = []
+        metadata['created'] = today
+        metadata['updated'] = today
+
+        # Generate filename and path
+        filename = self._sanitize_filename(name)
+        goal_path = f"30-goals/{current_year}/{filename}.md"
+
+        # Write file
+        self.write_file(goal_path, metadata, processed['content'])
+
+        return {
+            'path': goal_path,
+            'metadata': metadata,
+            'content': processed['content']
+        }
+
+    def create_daily_note(self, date: datetime = None) -> Dict:
+        """Create a daily note using template
+
+        Args:
+            date: Date for the note (defaults to today)
+
+        Returns:
+            Dict with created daily note data and path
+        """
+        if date is None:
+            date = datetime.now(self.tz)
+
+        date_str = date.strftime('%Y-%m-%d')
+        day_name = date.strftime('%A')
+        date_formatted = date.strftime('%B %d, %Y')
+
+        # Load and process template
+        template = self._load_template('_daily_.md')
+        processed = self._process_template(template, {
+            'date': date_str,
+            'day': day_name[:3],  # Mon, Tue, etc.
+            'day_full': day_name,
+            'date_formatted': date_formatted
+        })
+
+        # Get current token balance
+        try:
+            ledger = self.read_token_ledger()
+            tokens_total = ledger['metadata'].get('total_tokens', 0)
+        except FileNotFoundError:
+            tokens_total = 0
+
+        # Override metadata
+        metadata = processed['metadata']
+        metadata['type'] = 'daily'
+        metadata['date'] = date_str
+        metadata['day_of_week'] = day_name
+        metadata['tokens_earned'] = 0
+        metadata['tokens_total'] = tokens_total
+        metadata['mood'] = None
+        metadata['energy'] = None
+        metadata['completed_habits'] = []
+        metadata['tags'] = ['daily']
+        metadata['created'] = date_str
+        metadata['updated'] = date_str
+
+        # Update content with token total
+        content = processed['content']
+        content = content.replace('**Total Bank:** 0 tokens', f'**Total Bank:** {tokens_total} tokens')
+
+        # Generate path
+        daily_path = f"10-daily/{date_str}.md"
+
+        # Write file
+        self.write_file(daily_path, metadata, content)
+
+        return {
+            'path': daily_path,
+            'metadata': metadata,
+            'content': content
+        }
+
+    def complete_task(self, task_path: str, award_tokens: bool = True) -> Dict:
+        """Mark a task as complete and move to archive
+
+        Args:
+            task_path: Path to task file (relative to vault)
+            award_tokens: Whether to award tokens for completion
+
+        Returns:
+            Dict with completion info
+        """
+        # Read task
+        task = self.read_file(task_path)
+        metadata = task['metadata']
+
+        # Get task name
+        task_name = metadata.get('name', 'Task')
+
+        # Award tokens if requested
+        tokens_earned = 0
+        if award_tokens:
+            tokens_earned = metadata.get('tokens_on_completion', 5)
+            self.update_tokens(tokens_earned, f"Completed: {task_name}")
+
+        # Update metadata
+        today = datetime.now(self.tz).strftime('%Y-%m-%d')
+        metadata['status'] = 'done'
+        metadata['completed_date'] = today
+        metadata['updated'] = today
+
+        # Generate archive path
+        filename = Path(task_path).name
+        archive_path = f"40-tasks/archive/{filename}"
+
+        # Write to archive
+        self.write_file(archive_path, metadata, task['content'])
+
+        # Delete from active
+        active_file = self.vault_path / task_path
+        if active_file.exists():
+            active_file.unlink()
+
+        return {
+            'task_name': task_name,
+            'tokens_earned': tokens_earned,
+            'archive_path': archive_path
+        }
+
+    def find_task_by_name(self, name: str) -> Optional[Dict]:
+        """Find a task by name (fuzzy match)
+
+        Args:
+            name: Task name to search for
+
+        Returns:
+            Task dict if found, None otherwise
+        """
+        tasks = self.list_active_tasks()
+        name_lower = name.lower()
+
+        for task in tasks:
+            task_name = task['metadata'].get('name', '')
+            # Also check content for heading
+            if not task_name:
+                content = task.get('content', '')
+                for line in content.split('\n'):
+                    if line.startswith('#'):
+                        task_name = line.lstrip('#').strip()
+                        break
+
+            if task_name and (name_lower in task_name.lower() or task_name.lower() in name_lower):
+                return task
+
+        return None

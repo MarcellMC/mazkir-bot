@@ -95,45 +95,56 @@ When Marc completes an activity:
 
         return response.content[0].text
 
-    def parse_intent(self, message: str, habits_list: List[str] = None) -> Dict:
+    def parse_intent(self, message: str, habits_list: List[str] = None,
+                     tasks_list: List[str] = None) -> Dict:
         """Parse user message to determine intent and extract structured data
 
         Args:
             message: User's message
             habits_list: List of habit names for context
+            tasks_list: List of task names for context
 
         Returns:
-            Dict with 'intent', 'data', and 'response_text'
+            Dict with 'intent', 'data', and 'reasoning'
         """
         now = datetime.now(self.tz)
 
-        # Build context with available habits
-        habits_context = ""
+        # Build context
+        context_parts = []
         if habits_list:
-            habits_context = f"\n\nAvailable habits: {', '.join(habits_list)}"
+            context_parts.append(f"Available habits: {', '.join(habits_list)}")
+        if tasks_list:
+            context_parts.append(f"Active tasks: {', '.join(tasks_list[:10])}")  # Limit to 10
+
+        context = "\n".join(context_parts) if context_parts else ""
 
         intent_prompt = f"""Analyze this message and determine the user's intent.
 
 Message: "{message}"
 
 Current date: {now.strftime('%Y-%m-%d')}
-Current time: {now.strftime('%H:%M')}{habits_context}
+Current time: {now.strftime('%H:%M')}
+{context}
 
 Possible intents:
 1. HABIT_COMPLETION - User completed a habit (e.g., "I completed gym", "did meditation", "finished reading")
-2. TASK_CREATION - User wants to create a task (e.g., "create task: buy milk", "add task to buy groceries")
-3. TASK_COMPLETION - User completed a task
-4. QUERY - User is asking a question (e.g., "show my streaks", "what's my progress")
-5. GENERAL_CHAT - General conversation
+2. HABIT_CREATION - User wants to create a new habit (e.g., "create habit: morning run", "add habit for reading")
+3. TASK_CREATION - User wants to create a task (e.g., "create task: buy milk", "add task to buy groceries", "remind me to...")
+4. TASK_COMPLETION - User completed a task (e.g., "I finished buying groceries", "done with taxes", "completed the task")
+5. GOAL_CREATION - User wants to create a goal (e.g., "create goal: learn python", "new goal to lose weight")
+6. QUERY - User is asking a question (e.g., "show my streaks", "what's my progress", "list tasks")
+7. GENERAL_CHAT - General conversation or unclear intent
 
 Return a JSON object with:
 {{
-  "intent": "HABIT_COMPLETION|TASK_CREATION|TASK_COMPLETION|QUERY|GENERAL_CHAT",
+  "intent": "HABIT_COMPLETION|HABIT_CREATION|TASK_CREATION|TASK_COMPLETION|GOAL_CREATION|QUERY|GENERAL_CHAT",
   "data": {{
     // For HABIT_COMPLETION: {{"habit_name": "gym", "confidence": "high|medium|low"}}
-    // For TASK_CREATION: {{"task_description": "buy milk", "priority": 3}}
-    // For TASK_COMPLETION: {{"task_name": "..."}}
-    // For QUERY: {{"query_type": "streaks|progress|tokens"}}
+    // For HABIT_CREATION: {{"habit_name": "morning run", "frequency": "daily", "category": "health"}}
+    // For TASK_CREATION: {{"task_name": "buy milk", "priority": 3, "due_date": "2026-02-06" or null, "category": "personal"}}
+    // For TASK_COMPLETION: {{"task_name": "buy groceries", "confidence": "high|medium|low"}}
+    // For GOAL_CREATION: {{"goal_name": "learn python", "priority": "high|medium|low", "category": "learning"}}
+    // For QUERY: {{"query_type": "streaks|progress|tokens|tasks|habits|goals"}}
     // For GENERAL_CHAT: {{}}
   }},
   "reasoning": "Brief explanation of why you chose this intent"
